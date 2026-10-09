@@ -22,6 +22,8 @@ import threading
 import fitz  # PyMuPDF
 import numpy as np
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
@@ -268,6 +270,15 @@ async def process_endpoint(request):
     )
 
 
+async def test_page(request):
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test.html"), "rb") as f:
+            html = f.read()
+    except FileNotFoundError:
+        return PlainTextResponse("test.html not found", status_code=404)
+    return Response(html, media_type="text/html; charset=utf-8")
+
+
 async def health(request):
     return PlainTextResponse("ok")
 
@@ -275,4 +286,13 @@ async def health(request):
 app = Starlette(routes=[
     Route("/process", process_endpoint, methods=["POST"]),
     Route("/", health, methods=["GET"]),
+    Route("/test", test_page, methods=["GET"]),
+], middleware=[
+    Middleware(
+        CORSMiddleware,
+        allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["X-Total-Pages"],
+    ),
 ])
