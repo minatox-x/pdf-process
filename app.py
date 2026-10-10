@@ -4,20 +4,10 @@ Watermark remover + transparent proxy service (PyMuPDF + numpy + httpx + Starlet
 POST /process
   Body: the "data" string, OR the full JSON {"success":true,"data":"..."}
         (raw text, a JSON string, or JSON object all work)
-  Query params (all optional):
-    page    1-based page number           (default 1)
-    scale   render scale, 0.5-4           (default 1.5)
-    r,g,b   watermark color to remove     (default 220,220,220)
-    tol     RGB distance tolerance 0-150  (default 35)
-    format  png | jpeg                    (default png)
-    quality jpeg quality 1-100            (default 90)
+  Query params (optional):
+    page    1-based page number (default 1)
+    format  png | jpeg          (default png)
   Returns: the processed image bytes. Header X-Total-Pages = page count.
-
-GET|POST|* /proxy?url=<base64url-encoded-url>
-  Decodes the `url` param (URL-decoded first, then base64-decoded) and
-  forwards the request verbatim — method, headers, body, cookies,
-  Authorization — to the target. The target's status, headers, and body
-  are streamed back unchanged. Hop-by-hop headers are stripped per RFC 7230.
 """
 import base64
 import json
@@ -38,19 +28,23 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
 KEY = (90, 165, 195, 60, 15, 240, 150, 105)
-# key[i % 8] ^ (i % 256) repeats every 256 bytes -> precompute one period
 XOR_MASK = np.array([KEY[i % 8] ^ (i % 256) for i in range(256)], dtype=np.uint8)
 
-MAX_BODY = int(float(os.getenv("MAX_BODY_MB", "1")) * 1024 * 1024)  # ~300 KB typical
-MAX_PIXELS = int(os.getenv("MAX_PIXELS", str(25_000_000)))
-MAX_JOBS = int(os.getenv("MAX_JOBS", "2"))  # concurrent renders per worker (bounds RAM)
-BAND_ROWS = 256  # process image in horizontal bands to keep temp memory tiny
+MAX_BODY = int(float(os.getenv("MAX_BODY_MB", "1")) * 1024 * 1024)
+MAX_PIXELS = int(os.getenv("MAX_PIXELS", str(35_000_000)))
+MAX_JOBS = int(os.getenv("MAX_JOBS", "2"))
+BAND_ROWS = 256
 
-MAX_QUEUE = int(os.getenv("MAX_QUEUE", "50"))  # waiting requests per worker
-QUEUE_TIMEOUT = float(os.getenv("QUEUE_TIMEOUT", "30"))  # max seconds spent waiting
+MAX_QUEUE = int(os.getenv("MAX_QUEUE", "50"))
+QUEUE_TIMEOUT = float(os.getenv("QUEUE_TIMEOUT", "30"))
+
+# --- LOCKED OPTIMAL DEFAULTS FOR PERFECT WATERMARK REMOVAL ---
+OPTIMAL_RGB = (240, 240, 240)  # Universal light-gray watermark target
+OPTIMAL_TOL = 40             # Balanced tolerance to catch faded traces
+OPTIMAL_SCALE = 2.0          # High resolution scale for razor-sharp text
 
 _sem = asyncio.Semaphore(MAX_JOBS)
-_pending = 0  # running + waiting (single event loop => no lock needed)
+_pending = 0
 
 
 def busy():
@@ -66,7 +60,7 @@ class BadRequest(Exception):
 
 
 class Cancelled(Exception):
-    """Client went away; abort work as soon as possible."""
+    pass
 
 
 class QueueTimeout(Exception):
@@ -106,55 +100,48 @@ def decode_pdf(b64: str) -> bytes:
     return out.tobytes()
 
 
-def remove_color(buf: bytearray, w: int, h: int, rgb, tol: int, cancel):
+def remove_color(buf: bytearray, w: int, h: int, cancel):
     arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
-    t = np.array(rgb, dtype=np.float32)
-    
-    # Perceptual color weights (Human eye sensitivity: Green > Red > Blue)
-    weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
-    
-    # Smooth anti-aliasing transition boundary (prevents halos and jagged edges)
-    upper_tol = max(tol * 1.4, tol + 4.0)
-    
-    # Allow a small saturation threshold so neutral watermarks are caught 
-    # without destroying rich, colorful document elements.
-    max_sat = max(15.0, tol * 0.6)
+    t = np.array(OPTIMAL_RGB, dtype=np.float32)
+    tol_f = float(OPTIMAL_TOL)
+    tol2 = tol_f * tol_f
 
     for y in range(0, h, BAND_ROWS):
         if cancel.is_set():
             raise Cancelled
         band = arr[y:y + BAND_ROWS]
-        
-        # Work in float32 for high-precision mathematical blending
         band_f = band.astype(np.float32)
         
-        # 1. Perceptual color distance calculation
+        # 1. Vectorized Euclidean distance squared from target watermark RGB
         diff = band_f - t
-        dist = np.sqrt(np.sum((diff ** 2) * weights, axis=2))
+        dist2 = np.sum(diff * diff, axis=2)
         
-        # 2. Saturation check: ensure we only target near-neutral/achromatic watermark tones
-        max_rgb = band_f.max(axis=2)
-        min_rgb = band_f.min(axis=2)
-        saturation = max_rgb - min_rgb
-        sat_mask = saturation <= max_sat
-        
-        # 3. Build smooth blend masks (exact match vs. feather transition zone)
-        blend = np.zeros(dist.shape, dtype=np.float32)
-        exact = (dist <= tol) & sat_mask
-        fade = (dist > tol) & (dist <= upper_tol) & sat_mask
-        
-        blend[exact] = 1.0
-        if upper_tol > tol:
-            blend[fade] = 1.0 - (dist[fade] - tol) / (upper_tol - tol)
+        mask = dist2 <= tol2
+        if not np.any(mask):
+            continue
             
-        # Fully vectorized in-place blending toward pristine white (255.0)
-        if np.any(blend > 0):
-            b_exp = blend[..., np.newaxis]
-            band_f = band_f * (1.0 - b_exp) + 255.0 * b_exp
-            band[...] = np.clip(band_f, 0, 255).astype(np.uint8)
+        # 2. Cosine smoothstep feathering for natural, anti-aliased edge transition
+        dist = np.sqrt(dist2)
+        weight = np.zeros_like(dist)
+        valid = mask & (dist <= tol_f)
+        
+        x = np.clip(dist[valid] / tol_f, 0.0, 1.0)
+        weight[valid] = 0.5 * (1.0 + np.cos(x * np.pi))
+        
+        # 3. Smart Foreground & Text Stroke Protection (luminance ramp)
+        luminance = band_f.mean(axis=2)
+        text_protection = np.clip((luminance - 50.0) / 70.0, 0.0, 1.0)
+        
+        final_weight = weight * text_protection
+        
+        # 4. Precision in-place blending toward immaculate white (255.0)
+        if np.any(final_weight > 0):
+            w_exp = final_weight[..., np.newaxis]
+            blended = band_f * (1.0 - w_exp) + 255.0 * w_exp
+            band[...] = np.clip(blended, 0, 255).astype(np.uint8)
 
-def process(body: bytes, page: int, scale: float, rgb, tol: int, fmt: str,
-            quality: int, cancel: threading.Event):
+
+def process(body: bytes, page: int, fmt: str, quality: int, cancel: threading.Event):
     def check():
         if cancel.is_set():
             raise Cancelled
@@ -173,9 +160,9 @@ def process(body: bytes, page: int, scale: float, rgb, tol: int, fmt: str,
         pg = doc[page - 1]
         check()
         r = pg.rect
-        if r.width * scale * r.height * scale > MAX_PIXELS:
-            raise BadRequest("Render too large; lower scale")
-        pix = pg.get_pixmap(matrix=fitz.Matrix(scale, scale),
+        if r.width * OPTIMAL_SCALE * r.height * OPTIMAL_SCALE > MAX_PIXELS:
+            raise BadRequest("Render too large")
+        pix = pg.get_pixmap(matrix=fitz.Matrix(OPTIMAL_SCALE, OPTIMAL_SCALE),
                             colorspace=fitz.csRGB, alpha=False)
     finally:
         doc.close()
@@ -185,8 +172,10 @@ def process(body: bytes, page: int, scale: float, rgb, tol: int, fmt: str,
     w, h = pix.width, pix.height
     buf = bytearray(pix.samples)
     del pix
-    if tol > 0:
-        remove_color(buf, w, h, rgb, tol, cancel)
+    
+    # Run the optimized watermark remover with locked-in defaults
+    remove_color(buf, w, h, cancel)
+    
     check()
     out_pix = fitz.Pixmap(fitz.csRGB, w, h, bytes(buf), False)
     del buf
@@ -207,12 +196,6 @@ def _int(q, name, default, lo, hi):
 
 
 async def run_job(body, args, cancel):
-    """Wait for a slot, then run the render in a thread.
-
-    If this task is cancelled (client left), the waiting is abandoned at once
-    or the running thread is told to stop at its next checkpoint. The slot is
-    only released when the thread has really stopped, so memory stays bounded.
-    """
     try:
         await asyncio.wait_for(_sem.acquire(), QUEUE_TIMEOUT)
     except asyncio.TimeoutError:
@@ -228,7 +211,7 @@ async def run_job(body, args, cancel):
 
         def _done(f):
             if not f.cancelled():
-                f.exception()  # mark retrieved, ignore Cancelled
+                f.exception()
             _sem.release()
 
         fut.add_done_callback(_done)
@@ -245,7 +228,6 @@ async def watch_disconnect(request):
 
 async def process_endpoint(request):
     global _pending
-    # reject early, before reading the body, so a full queue costs ~no memory
     if _pending >= MAX_JOBS + MAX_QUEUE:
         return busy()
 
@@ -265,19 +247,13 @@ async def process_endpoint(request):
     q = request.query_params
     try:
         page = _int(q, "page", 1, 1, 100000)
-        tol = _int(q, "tol", 35, 0, 150)
-        rgb = (_int(q, "r", 220, 0, 255), _int(q, "g", 220, 0, 255), _int(q, "b", 220, 0, 255))
         quality = _int(q, "quality", 90, 1, 100)
-        try:
-            scale = max(0.5, min(4.0, float(q.get("scale", 1.5))))
-        except ValueError:
-            raise BadRequest("scale must be a number")
         fmt = "jpeg" if q.get("format", "png").lower() in ("jpeg", "jpg") else "png"
     except BadRequest as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
     cancel = threading.Event()
-    args = (page, scale, rgb, tol, fmt, quality)
+    args = (page, fmt, quality)
     _pending += 1
     job = asyncio.ensure_future(run_job(bytes(body), args, cancel))
     watcher = asyncio.ensure_future(watch_disconnect(request))
@@ -285,7 +261,6 @@ async def process_endpoint(request):
     try:
         done, _ = await asyncio.wait({job, watcher}, return_when=asyncio.FIRST_COMPLETED)
         if job not in done:
-            # client disconnected while queued or mid-process: drop immediately
             job.cancel()
             return Response(status_code=499)
         data, total = job.result()
@@ -296,10 +271,9 @@ async def process_endpoint(request):
     except BadRequest as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except asyncio.CancelledError:
-        # the request handler itself was cancelled by the server
         job.cancel()
         raise
-    except Exception as e:  # noqa
+    except Exception as e:
         return JSONResponse({"error": f"Processing failed: {e}"}, status_code=500)
     finally:
         watcher.cancel()
@@ -316,21 +290,16 @@ async def process_endpoint(request):
 # Transparent proxy
 # ---------------------------------------------------------------------------
 
-# Hop-by-hop headers that must never be forwarded (RFC 7230 §6.1 + common extras)
 _HOP_BY_HOP = frozenset([
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
     "proxy-connection",
 ])
 
-# Headers that become invalid after httpx transparently decompresses the body
 _STRIP_FROM_RESPONSE = _HOP_BY_HOP | frozenset(["content-encoding", "content-length"])
 
-# Single shared async client — keeps a connection pool, reuses TLS sessions
-# decompress=True (default): httpx decodes gzip/br/deflate for us so we always
-# forward plain bytes — we just must not re-advertise Content-Encoding downstream.
 _proxy_client = httpx.AsyncClient(
-    follow_redirects=False,          # let the caller handle redirects
+    follow_redirects=False,
     timeout=httpx.Timeout(
         connect=float(os.getenv("PROXY_CONNECT_TIMEOUT", "10")),
         read=float(os.getenv("PROXY_READ_TIMEOUT", "60")),
@@ -346,10 +315,7 @@ _proxy_client = httpx.AsyncClient(
 
 
 def _decode_proxy_url(raw: str) -> str:
-    """URL-decode then base64-decode the `url` query param."""
-    # Step 1: undo any %XX percent-encoding the caller applied
     unquoted = urllib.parse.unquote(raw)
-    # Step 2: fix padding and base64-decode
     padded = unquoted + "=" * (-len(unquoted) % 4)
     try:
         return base64.b64decode(padded).decode("utf-8")
@@ -358,12 +324,6 @@ def _decode_proxy_url(raw: str) -> str:
 
 
 def _forward_headers(incoming_headers, host: str) -> dict:
-    """Build the outbound header dict: strip hop-by-hop, rewrite Host.
-
-    We also drop Accept-Encoding so the upstream always replies with plain
-    (uncompressed) bytes — httpx would decompress anyway, but this avoids
-    any edge-case where a server ignores decompress=True behaviour.
-    """
     _skip = _HOP_BY_HOP | frozenset(["host", "accept-encoding"])
     out = {}
     for k, v in incoming_headers.items():
@@ -374,12 +334,6 @@ def _forward_headers(incoming_headers, host: str) -> dict:
 
 
 def _response_headers(upstream_headers) -> dict:
-    """Strip hop-by-hop + encoding/length headers from the upstream response.
-
-    httpx transparently decompresses gzip/br/deflate, so the body we forward
-    is already plain bytes.  We must drop Content-Encoding (no longer true)
-    and Content-Length (now wrong) so the client doesn't choke on the mismatch.
-    """
     out = {}
     for k, v in upstream_headers.items():
         if k.lower() in _STRIP_FROM_RESPONSE:
@@ -398,11 +352,9 @@ async def proxy_endpoint(request):
     except BadRequest as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    # Basic sanity: must look like an http(s) URL
     if not target_url.lower().startswith(("http://", "https://")):
         return JSONResponse({"error": "Decoded URL must start with http:// or https://"}, status_code=400)
 
-    # Read the body (stream it to avoid buffering huge payloads needlessly)
     try:
         body = await request.body()
     except ClientDisconnect:
