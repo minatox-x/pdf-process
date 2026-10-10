@@ -1,5 +1,5 @@
 """
-Watermark remover service (PyMuPDF + numpy + Starlette).
+Watermark remover + transparent proxy service (PyMuPDF + numpy + httpx + Starlette).
 
 POST /process
   Body: the "data" string, OR the full JSON {"success":true,"data":"..."}
@@ -12,12 +12,21 @@ POST /process
     format  png | jpeg                    (default png)
     quality jpeg quality 1-100            (default 90)
   Returns: the processed image bytes. Header X-Total-Pages = page count.
+
+GET|POST|* /proxy?url=<base64url-encoded-url>
+  Decodes the `url` param (URL-decoded first, then base64-decoded) and
+  forwards the request verbatim — method, headers, body, cookies,
+  Authorization — to the target. The target's status, headers, and body
+  are streamed back unchanged. Hop-by-hop headers are stripped per RFC 7230.
 """
 import base64
 import json
 import os
 import asyncio
 import threading
+import urllib.parse
+
+import httpx
 
 import fitz  # PyMuPDF
 import numpy as np
@@ -270,6 +279,111 @@ async def process_endpoint(request):
     )
 
 
+# ---------------------------------------------------------------------------
+# Transparent proxy
+# ---------------------------------------------------------------------------
+
+# Hop-by-hop headers that must never be forwarded (RFC 7230 §6.1 + common extras)
+_HOP_BY_HOP = frozenset([
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade",
+    "proxy-connection", "content-encoding",  # re-encoded by httpx
+])
+
+# Single shared async client — keeps a connection pool, reuses TLS sessions
+_proxy_client = httpx.AsyncClient(
+    follow_redirects=False,          # let the caller handle redirects
+    timeout=httpx.Timeout(
+        connect=float(os.getenv("PROXY_CONNECT_TIMEOUT", "10")),
+        read=float(os.getenv("PROXY_READ_TIMEOUT", "60")),
+        write=float(os.getenv("PROXY_WRITE_TIMEOUT", "30")),
+        pool=float(os.getenv("PROXY_POOL_TIMEOUT", "10")),
+    ),
+    limits=httpx.Limits(
+        max_connections=int(os.getenv("PROXY_MAX_CONN", "100")),
+        max_keepalive_connections=int(os.getenv("PROXY_MAX_KEEPALIVE", "20")),
+    ),
+    verify=os.getenv("PROXY_VERIFY_SSL", "true").lower() != "false",
+)
+
+
+def _decode_proxy_url(raw: str) -> str:
+    """URL-decode then base64-decode the `url` query param."""
+    # Step 1: undo any %XX percent-encoding the caller applied
+    unquoted = urllib.parse.unquote(raw)
+    # Step 2: fix padding and base64-decode
+    padded = unquoted + "=" * (-len(unquoted) % 4)
+    try:
+        return base64.b64decode(padded).decode("utf-8")
+    except Exception:
+        raise BadRequest("url param is not valid base64")
+
+
+def _forward_headers(incoming_headers, host: str) -> dict:
+    """Build the outbound header dict: strip hop-by-hop, rewrite Host."""
+    out = {}
+    for k, v in incoming_headers.items():
+        if k.lower() in _HOP_BY_HOP:
+            continue
+        if k.lower() == "host":
+            continue  # will be set from the target URL by httpx
+        out[k] = v
+    return out
+
+
+def _response_headers(upstream_headers) -> dict:
+    """Strip hop-by-hop from the upstream response before forwarding."""
+    out = {}
+    for k, v in upstream_headers.items():
+        if k.lower() in _HOP_BY_HOP:
+            continue
+        out[k] = v
+    return out
+
+
+async def proxy_endpoint(request):
+    raw_param = request.query_params.get("url", "").strip()
+    if not raw_param:
+        return JSONResponse({"error": "Missing 'url' query parameter"}, status_code=400)
+
+    try:
+        target_url = _decode_proxy_url(raw_param)
+    except BadRequest as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    # Basic sanity: must look like an http(s) URL
+    if not target_url.lower().startswith(("http://", "https://")):
+        return JSONResponse({"error": "Decoded URL must start with http:// or https://"}, status_code=400)
+
+    # Read the body (stream it to avoid buffering huge payloads needlessly)
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        return Response(status_code=499)
+
+    out_headers = _forward_headers(request.headers, target_url)
+
+    try:
+        upstream = await _proxy_client.request(
+            method=request.method,
+            url=target_url,
+            headers=out_headers,
+            content=body or None,
+        )
+    except httpx.TimeoutException:
+        return JSONResponse({"error": "Upstream request timed out"}, status_code=504)
+    except httpx.RequestError as exc:
+        return JSONResponse({"error": f"Upstream connection error: {exc}"}, status_code=502)
+
+    resp_headers = _response_headers(upstream.headers)
+
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=resp_headers,
+    )
+
+
 async def test_page(request):
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test.html"), "rb") as f:
@@ -285,14 +399,15 @@ async def health(request):
 
 app = Starlette(routes=[
     Route("/process", process_endpoint, methods=["POST"]),
+    Route("/proxy", proxy_endpoint, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]),
     Route("/", health, methods=["GET"]),
     Route("/test", test_page, methods=["GET"]),
 ], middleware=[
     Middleware(
         CORSMiddleware,
         allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["X-Total-Pages"],
+        expose_headers=["X-Total-Pages", "Content-Disposition", "Content-Type", "Content-Length"],
     ),
 ])
