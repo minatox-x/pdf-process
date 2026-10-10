@@ -287,10 +287,15 @@ async def process_endpoint(request):
 _HOP_BY_HOP = frozenset([
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
-    "proxy-connection", "content-encoding",  # re-encoded by httpx
+    "proxy-connection",
 ])
 
+# Headers that become invalid after httpx transparently decompresses the body
+_STRIP_FROM_RESPONSE = _HOP_BY_HOP | frozenset(["content-encoding", "content-length"])
+
 # Single shared async client — keeps a connection pool, reuses TLS sessions
+# decompress=True (default): httpx decodes gzip/br/deflate for us so we always
+# forward plain bytes — we just must not re-advertise Content-Encoding downstream.
 _proxy_client = httpx.AsyncClient(
     follow_redirects=False,          # let the caller handle redirects
     timeout=httpx.Timeout(
@@ -320,22 +325,31 @@ def _decode_proxy_url(raw: str) -> str:
 
 
 def _forward_headers(incoming_headers, host: str) -> dict:
-    """Build the outbound header dict: strip hop-by-hop, rewrite Host."""
+    """Build the outbound header dict: strip hop-by-hop, rewrite Host.
+
+    We also drop Accept-Encoding so the upstream always replies with plain
+    (uncompressed) bytes — httpx would decompress anyway, but this avoids
+    any edge-case where a server ignores decompress=True behaviour.
+    """
+    _skip = _HOP_BY_HOP | frozenset(["host", "accept-encoding"])
     out = {}
     for k, v in incoming_headers.items():
-        if k.lower() in _HOP_BY_HOP:
+        if k.lower() in _skip:
             continue
-        if k.lower() == "host":
-            continue  # will be set from the target URL by httpx
         out[k] = v
     return out
 
 
 def _response_headers(upstream_headers) -> dict:
-    """Strip hop-by-hop from the upstream response before forwarding."""
+    """Strip hop-by-hop + encoding/length headers from the upstream response.
+
+    httpx transparently decompresses gzip/br/deflate, so the body we forward
+    is already plain bytes.  We must drop Content-Encoding (no longer true)
+    and Content-Length (now wrong) so the client doesn't choke on the mismatch.
+    """
     out = {}
     for k, v in upstream_headers.items():
-        if k.lower() in _HOP_BY_HOP:
+        if k.lower() in _STRIP_FROM_RESPONSE:
             continue
         out[k] = v
     return out
