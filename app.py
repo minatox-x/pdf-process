@@ -108,17 +108,50 @@ def decode_pdf(b64: str) -> bytes:
 
 def remove_color(buf: bytearray, w: int, h: int, rgb, tol: int, cancel):
     arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
-    t = np.array(rgb, dtype=np.int32)
-    tol2 = tol * tol
+    t = np.array(rgb, dtype=np.float32)
+    
+    # Perceptual color weights (Human eye sensitivity: Green > Red > Blue)
+    weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    
+    # Smooth anti-aliasing transition boundary (prevents halos and jagged edges)
+    upper_tol = max(tol * 1.4, tol + 4.0)
+    
+    # Allow a small saturation threshold so neutral watermarks are caught 
+    # without destroying rich, colorful document elements.
+    max_sat = max(15.0, tol * 0.6)
+
     for y in range(0, h, BAND_ROWS):
         if cancel.is_set():
             raise Cancelled
         band = arr[y:y + BAND_ROWS]
-        d = band.astype(np.int32) - t
-        d *= d
-        mask = d.sum(axis=2) <= tol2
-        band[mask] = 255
-
+        
+        # Work in float32 for high-precision mathematical blending
+        band_f = band.astype(np.float32)
+        
+        # 1. Perceptual color distance calculation
+        diff = band_f - t
+        dist = np.sqrt(np.sum((diff ** 2) * weights, axis=2))
+        
+        # 2. Saturation check: ensure we only target near-neutral/achromatic watermark tones
+        max_rgb = band_f.max(axis=2)
+        min_rgb = band_f.min(axis=2)
+        saturation = max_rgb - min_rgb
+        sat_mask = saturation <= max_sat
+        
+        # 3. Build smooth blend masks (exact match vs. feather transition zone)
+        blend = np.zeros(dist.shape, dtype=np.float32)
+        exact = (dist <= tol) & sat_mask
+        fade = (dist > tol) & (dist <= upper_tol) & sat_mask
+        
+        blend[exact] = 1.0
+        if upper_tol > tol:
+            blend[fade] = 1.0 - (dist[fade] - tol) / (upper_tol - tol)
+            
+        # Fully vectorized in-place blending toward pristine white (255.0)
+        if np.any(blend > 0):
+            b_exp = blend[..., np.newaxis]
+            band_f = band_f * (1.0 - b_exp) + 255.0 * b_exp
+            band[...] = np.clip(band_f, 0, 255).astype(np.uint8)
 
 def process(body: bytes, page: int, scale: float, rgb, tol: int, fmt: str,
             quality: int, cancel: threading.Event):
