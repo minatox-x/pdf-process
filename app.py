@@ -4,14 +4,28 @@ Watermark remover + transparent proxy service (PyMuPDF + numpy + httpx + Starlet
 POST /process
   Body: the "data" string, OR the full JSON {"success":true,"data":"..."}
         (raw text, a JSON string, or JSON object all work)
-  Query params (all optional):
-    page    1-based page number           (default 1)
-    scale   render scale, 0.5-4           (default 1.5)
-    r,g,b   watermark color to remove     (default 220,220,220)
-    tol     RGB distance tolerance 0-150  (default 35)
-    format  png | jpeg                    (default png)
-    quality jpeg quality 1-100            (default 90)
-  Returns: the processed image bytes. Header X-Total-Pages = page count.
+  Query parameters are IGNORED. Everything is fixed:
+    page       always 1
+    scale      chosen automatically from the page size (target 3.0, 2.5 floor
+               unless the memory cap forces it lower)
+    watermark  opacity 20.60 %, colour RGB(158, 159, 157)
+    tolerance  4 RGB levels
+    format     PNG (lossless)
+  Returns: the processed PNG bytes.
+  Headers: X-Total-Pages = page count, X-Scale = scale actually used.
+
+How the watermark is removed
+  The watermark was alpha-composited over the page:
+        W = (1 - a) * C + a * K          a = 0.206, K = (158, 159, 157)
+  so the clean pixel is   C = (W - a * K) / (1 - a).
+  1. Pixels within +-4 levels of the "watermark over white" colour are found.
+  2. Only pixels that sit in a flat patch of such pixels are kept as seeds
+     (this stops anti-aliased text edges from being mistaken for watermark).
+  3. Seeds are grown a few pixels so that the watermark where it overlaps
+     text / anti-aliased edges is covered too.
+  4. Inside that mask the exact inverse of the compositing formula is applied
+     (per-channel lookup table), and near-white leftovers snap to pure white.
+  Everything outside the mask is left byte-for-byte untouched.
 
 GET|POST|* /proxy?url=<base64url-encoded-url>
   Decodes the `url` param (URL-decoded first, then base64-decoded) and
@@ -21,6 +35,7 @@ GET|POST|* /proxy?url=<base64url-encoded-url>
 """
 import base64
 import json
+import math
 import os
 import asyncio
 import threading
@@ -42,12 +57,28 @@ KEY = (90, 165, 195, 60, 15, 240, 150, 105)
 XOR_MASK = np.array([KEY[i % 8] ^ (i % 256) for i in range(256)], dtype=np.uint8)
 
 MAX_BODY = int(float(os.getenv("MAX_BODY_MB", "1")) * 1024 * 1024)  # ~300 KB typical
-MAX_PIXELS = int(os.getenv("MAX_PIXELS", str(25_000_000)))
+MAX_PIXELS = int(os.getenv("MAX_PIXELS", str(25_000_000)))  # hard cap per render
 MAX_JOBS = int(os.getenv("MAX_JOBS", "2"))  # concurrent renders per worker (bounds RAM)
 BAND_ROWS = 256  # process image in horizontal bands to keep temp memory tiny
 
 MAX_QUEUE = int(os.getenv("MAX_QUEUE", "50"))  # waiting requests per worker
 QUEUE_TIMEOUT = float(os.getenv("QUEUE_TIMEOUT", "30"))  # max seconds spent waiting
+
+# ---------------------------------------------------------------------------
+# Fixed watermark model (measured) — request parameters can NOT change these
+# ---------------------------------------------------------------------------
+PAGE_INDEX = 0                      # always page 1
+WM_ALPHA = 0.2060                   # estimated watermark opacity (20.60 %)
+WM_COLOR = (158, 159, 157)          # estimated watermark colour K
+WM_ON_WHITE = (238, 238, 238)       # measured watermark-over-white (sample 1)
+TOL = 4                             # +-4 RGB levels around WM_ON_WHITE
+
+SCALE_TARGET = 3.0                  # preferred render scale
+SCALE_PREF_MIN = 2.5                # don't go below this unless forced by MAX_PIXELS
+SOFT_PIXELS = int(os.getenv("SOFT_PIXELS", str(12_000_000)))  # above this, ease toward 2.5
+
+MIN_NEIGHBORS = 4                   # of 8 neighbours must also match for a seed pixel
+SNAP_WHITE = 250                    # restored channel values >= this become 255
 
 _sem = asyncio.Semaphore(MAX_JOBS)
 _pending = 0  # running + waiting (single event loop => no lock needed)
@@ -106,22 +137,124 @@ def decode_pdf(b64: str) -> bytes:
     return out.tobytes()
 
 
-def remove_color(buf: bytearray, w: int, h: int, rgb, tol: int, cancel):
+# ---------------------------------------------------------------------------
+# Scale selection
+# ---------------------------------------------------------------------------
+
+def pick_scale(width_pt: float, height_pt: float) -> float:
+    """Pick the render scale from the page size.
+
+    Normal pages (A4, Letter, A3 ...) are rendered at 3.0. Very large pages ease
+    down toward 2.5 so the image stays a sane size. Only if even that would
+    exceed MAX_PIXELS is the scale reduced further (hard memory cap).
+    """
+    area = width_pt * height_pt
+    if area <= 0:
+        raise BadRequest("Page has no area")
+    s = SCALE_TARGET
+    if area * s * s > SOFT_PIXELS:
+        s = max(SCALE_PREF_MIN, math.sqrt(SOFT_PIXELS / area))
+    if area * s * s > MAX_PIXELS:
+        s = math.sqrt(MAX_PIXELS / area)
+    if s < 0.5:
+        raise BadRequest("Page too large to render")
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Watermark removal
+# ---------------------------------------------------------------------------
+
+def _build_luts():
+    """Per-channel lookup tables: exact inverse of  W = (1-a)*C + a*K."""
+    inv = 1.0 / (1.0 - WM_ALPHA)
+    v = np.arange(256, dtype=np.float32)
+    luts = []
+    for k in WM_COLOR:
+        c = np.clip(np.rint((v - WM_ALPHA * k) * inv), 0, 255)
+        c[c >= SNAP_WHITE] = 255
+        luts.append(c.astype(np.uint8))
+    return luts
+
+
+_LUTS = _build_luts()
+
+
+def _neighbor_count(m: np.ndarray) -> np.ndarray:
+    """Number of True pixels among the 8 neighbours of each pixel."""
+    hh, ww = m.shape
+    p = np.pad(m, 1)
+    cnt = np.zeros((hh, ww), dtype=np.uint8)
+    for dy in range(3):
+        for dx in range(3):
+            if dy == 1 and dx == 1:
+                continue
+            cnt += p[dy:dy + hh, dx:dx + ww]
+    return cnt
+
+
+def _dilate(m: np.ndarray, r: int) -> np.ndarray:
+    """Square dilation with radius r (separable, boolean)."""
+    out = m.copy()
+    for d in range(1, r + 1):
+        out[d:] |= m[:-d]
+        out[:-d] |= m[d:]
+    out2 = out.copy()
+    for d in range(1, r + 1):
+        out2[:, d:] |= out[:, :-d]
+        out2[:, :-d] |= out[:, d:]
+    return out2
+
+
+def remove_watermark(buf: bytearray, w: int, h: int, scale: float, cancel):
     arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
-    t = np.array(rgb, dtype=np.int32)
-    tol2 = tol * tol
+    center = np.array(WM_ON_WHITE, dtype=np.int16)
+
+    # Pass 0: pixels that look like "watermark over white" (within +-TOL levels)
+    match = np.empty((h, w), dtype=bool)
     for y in range(0, h, BAND_ROWS):
         if cancel.is_set():
             raise Cancelled
         band = arr[y:y + BAND_ROWS]
-        d = band.astype(np.int32) - t
-        d *= d
-        mask = d.sum(axis=2) <= tol2
-        band[mask] = 255
+        diff = np.abs(band.astype(np.int16) - center)
+        match[y:y + BAND_ROWS] = (diff <= TOL).all(axis=2)
+    if not match.any():
+        return
+
+    # Pass 1: keep only pixels inside a flat patch (rejects anti-aliased text edges)
+    seeds = np.zeros((h, w), dtype=bool)
+    for y in range(0, h, BAND_ROWS):
+        if cancel.is_set():
+            raise Cancelled
+        y0, y1 = max(0, y - 1), min(h, y + BAND_ROWS + 1)
+        blk = match[y0:y1]
+        cnt = _neighbor_count(blk)
+        ya = y - y0
+        yb = ya + min(BAND_ROWS, h - y)
+        seeds[y:y + BAND_ROWS] = blk[ya:yb] & (cnt[ya:yb] >= MIN_NEIGHBORS)
+    del match
+    if not seeds.any():
+        return
+
+    # Pass 2: grow seeds (covers watermark over text / glyph edges), then invert
+    r = max(2, int(math.ceil(1.5 * scale)))
+    for y in range(0, h, BAND_ROWS):
+        if cancel.is_set():
+            raise Cancelled
+        y0, y1 = max(0, y - r), min(h, y + BAND_ROWS + r)
+        grown = _dilate(seeds[y0:y1], r)
+        ya = y - y0
+        yb = ya + min(BAND_ROWS, h - y)
+        m = grown[ya:yb]
+        if not m.any():
+            continue
+        band = arr[y:y + BAND_ROWS]
+        for c in range(3):
+            ch = band[:, :, c]
+            ch[m] = _LUTS[c][ch[m]]
 
 
-def process(body: bytes, page: int, scale: float, rgb, tol: int, fmt: str,
-            quality: int, cancel: threading.Event):
+def process(body: bytes, cancel: threading.Event):
     def check():
         if cancel.is_set():
             raise Cancelled
@@ -135,13 +268,12 @@ def process(body: bytes, page: int, scale: float, rgb, tol: int, fmt: str,
         raise BadRequest("Decoded data is not a valid PDF (wrong key/data?)")
     try:
         total = doc.page_count
-        if not 1 <= page <= total:
-            raise BadRequest(f"page must be 1..{total}")
-        pg = doc[page - 1]
+        if total < 1:
+            raise BadRequest("PDF has no pages")
+        pg = doc[PAGE_INDEX]  # always the first page
         check()
         r = pg.rect
-        if r.width * scale * r.height * scale > MAX_PIXELS:
-            raise BadRequest("Render too large; lower scale")
+        scale = pick_scale(r.width, r.height)
         pix = pg.get_pixmap(matrix=fitz.Matrix(scale, scale),
                             colorspace=fitz.csRGB, alpha=False)
     finally:
@@ -152,28 +284,17 @@ def process(body: bytes, page: int, scale: float, rgb, tol: int, fmt: str,
     w, h = pix.width, pix.height
     buf = bytearray(pix.samples)
     del pix
-    if tol > 0:
-        remove_color(buf, w, h, rgb, tol, cancel)
+    check()
+    remove_watermark(buf, w, h, scale, cancel)
     check()
     out_pix = fitz.Pixmap(fitz.csRGB, w, h, bytes(buf), False)
     del buf
     check()
-    if fmt == "jpeg":
-        data = out_pix.tobytes("jpeg", jpg_quality=quality)
-    else:
-        data = out_pix.tobytes("png")
-    return data, total
+    data = out_pix.tobytes("png")
+    return data, total, scale
 
 
-def _int(q, name, default, lo, hi):
-    try:
-        v = int(q.get(name, default))
-    except ValueError:
-        raise BadRequest(f"{name} must be an integer")
-    return max(lo, min(hi, v))
-
-
-async def run_job(body, args, cancel):
+async def run_job(body, cancel):
     """Wait for a slot, then run the render in a thread.
 
     If this task is cancelled (client left), the waiting is abandoned at once
@@ -185,7 +306,7 @@ async def run_job(body, args, cancel):
     except asyncio.TimeoutError:
         raise QueueTimeout
     fut = asyncio.get_running_loop().run_in_executor(
-        None, lambda: process(body, *args, cancel))
+        None, lambda: process(body, cancel))
     handed_off = False
     try:
         return await asyncio.shield(fut)
@@ -229,24 +350,12 @@ async def process_endpoint(request):
     except ClientDisconnect:
         return Response(status_code=499)
 
-    q = request.query_params
-    try:
-        page = _int(q, "page", 1, 1, 100000)
-        tol = _int(q, "tol", 35, 0, 150)
-        rgb = (_int(q, "r", 220, 0, 255), _int(q, "g", 220, 0, 255), _int(q, "b", 220, 0, 255))
-        quality = _int(q, "quality", 90, 1, 100)
-        try:
-            scale = max(0.5, min(4.0, float(q.get("scale", 1.5))))
-        except ValueError:
-            raise BadRequest("scale must be a number")
-        fmt = "jpeg" if q.get("format", "png").lower() in ("jpeg", "jpg") else "png"
-    except BadRequest as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+    # NOTE: query parameters (page, scale, r, g, b, tol, format, quality) are
+    # deliberately ignored — all settings are fixed above.
 
     cancel = threading.Event()
-    args = (page, scale, rgb, tol, fmt, quality)
     _pending += 1
-    job = asyncio.ensure_future(run_job(bytes(body), args, cancel))
+    job = asyncio.ensure_future(run_job(bytes(body), cancel))
     watcher = asyncio.ensure_future(watch_disconnect(request))
     del body
     try:
@@ -255,7 +364,7 @@ async def process_endpoint(request):
             # client disconnected while queued or mid-process: drop immediately
             job.cancel()
             return Response(status_code=499)
-        data, total = job.result()
+        data, total, scale = job.result()
     except QueueTimeout:
         return busy()
     except Cancelled:
@@ -274,8 +383,12 @@ async def process_endpoint(request):
 
     return Response(
         data,
-        media_type="image/jpeg" if fmt == "jpeg" else "image/png",
-        headers={"X-Total-Pages": str(total), "Cache-Control": "no-store"},
+        media_type="image/png",
+        headers={
+            "X-Total-Pages": str(total),
+            "X-Scale": f"{scale:.3f}",
+            "Cache-Control": "no-store",
+        },
     )
 
 
@@ -422,6 +535,6 @@ app = Starlette(routes=[
         allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["X-Total-Pages", "Content-Disposition", "Content-Type", "Content-Length"],
+        expose_headers=["X-Total-Pages", "X-Scale", "Content-Disposition", "Content-Type", "Content-Length"],
     ),
 ])
